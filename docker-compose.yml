@@ -1,0 +1,41 @@
+version: "3.8"
+
+services:
+  mitmproxy:
+    image: mitmproxy/mitmproxy:11.0
+    container_name: nx502-mitmproxy
+    restart: unless-stopped
+    ports:
+      - "${MITM_LISTEN_HOST:-0.0.0.0}:${MITM_LISTEN_PORT:-9999}:9999"
+    volumes:
+      - ./addon:/app:ro
+      - ./logs:/var/log/mitmproxy
+    environment:
+      - TZ=${TZ:-Asia/Tokyo}
+      - HOST_IP=${HOST_IP:-192.168.250.100}
+      - GUEST_IP=${GUEST_IP:-192.168.250.101}
+      - PYTHONUNBUFFERED=1
+    command: >
+      mitmdump
+      --listen-host 0.0.0.0
+      --listen-port 9999
+      -s /app/mitmproxy_addon.py
+      --flow-detail 3
+      --no-server
+    stdin_open: true
+    tty: true
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+    networks:
+      nx502-net:
+        ipv4_address: 172.28.0.10
+
+networks:
+  nx502-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
