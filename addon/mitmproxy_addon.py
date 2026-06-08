@@ -6,13 +6,20 @@ delimited JSON payloads emitted by the NX502 controller in real time.
 All output is written to stdout (PYTHONUNBUFFERED=1 in the container)
 so `docker compose logs -f mitmproxy` shows events as they happen.
 
-Run with:
-    mitmdump -s /app/mitmproxy_addon.py --listen-host 0.0.0.0 \\
-             --listen-port 9999 --flow-detail 3
+Environment variables:
+    DISPLAY_LISTEN        - "host:port" shown in TCP START log line
+                            (default: "0.0.0.0:9999").
+    EXPECTED_GUEST_IP     - if set, warn when client peer IP differs.
+    MAX_LINE_BYTES        - drop and warn on lines larger than this
+                            (default: 1048576 = 1 MiB) to avoid OOM
+                            via never-terminated frames.
+    EXPECTED_INTERVAL_MS  - reported as expected RX interval in stats
+                            (default: 50).
 """
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 from datetime import datetime
@@ -28,7 +35,10 @@ RANGES: dict[str, tuple[float, float]] = {
     "angular_z": (-3.15,  3.15),
 }
 
-EXPECTED_INTERVAL_MS: float = 50.0
+DISPLAY_LISTEN: str       = os.environ.get("DISPLAY_LISTEN", "0.0.0.0:9999")
+EXPECTED_GUEST_IP: str    = os.environ.get("EXPECTED_GUEST_IP", "").strip()
+MAX_LINE_BYTES: int       = max(1024, int(os.environ.get("MAX_LINE_BYTES", "1048576")))
+EXPECTED_INTERVAL_MS: float = float(os.environ.get("EXPECTED_INTERVAL_MS", "50"))
 
 
 def _ts() -> str:
@@ -43,36 +53,26 @@ def _log(line: str) -> None:
 
 def _peer(flow: TCPFlow) -> tuple[str, str]:
     cc = flow.client_conn
-    sc = flow.server_conn
-
     if cc.peername:
         src = f"{cc.peername[0]}:{cc.peername[1]}"
     else:
         src = "?:?"
-
-    if cc.sockname:
-        dst = f"{cc.sockname[0]}:{cc.sockname[1]}"
-    elif sc.address:
-        dst = f"{sc.address[0]}:{sc.address[1]}"
-    else:
-        dst = "0.0.0.0:9999"
-
-    return src, dst
+    return src, DISPLAY_LISTEN
 
 
 class FlowStats:
     __slots__ = (
-        "start_ts", "last_msg_ts",
+        "start_ts", "last_rx_ts",
         "rx_packets", "tx_packets",
         "rx_bytes",   "tx_bytes",
         "json_ok",    "json_errors",
-        "schema_errors", "range_errors",
-        "intervals_ms", "rx_buffer",
+        "schema_errors", "range_errors", "oversize_drops",
+        "rx_intervals_ms", "rx_buffer",
     )
 
     def __init__(self) -> None:
         self.start_ts: float        = time.time()
-        self.last_msg_ts: float | None = None
+        self.last_rx_ts: float | None = None
         self.rx_packets: int        = 0
         self.tx_packets: int        = 0
         self.rx_bytes: int          = 0
@@ -81,7 +81,8 @@ class FlowStats:
         self.json_errors: int       = 0
         self.schema_errors: int     = 0
         self.range_errors: int      = 0
-        self.intervals_ms: list[float] = []
+        self.oversize_drops: int    = 0
+        self.rx_intervals_ms: list[float] = []
         self.rx_buffer: bytearray   = bytearray()
 
 
@@ -95,6 +96,14 @@ class NX502Monitor:
         src, dst = _peer(flow)
         _log(f"[{_ts()}] 🟢 [TCP START] {src} → {dst}")
 
+        if EXPECTED_GUEST_IP and flow.client_conn.peername:
+            actual_ip = flow.client_conn.peername[0]
+            if actual_ip != EXPECTED_GUEST_IP:
+                _log(
+                    f"[{_ts()}] ⚠️  [WARN] unexpected source IP: "
+                    f"got {actual_ip}, expected {EXPECTED_GUEST_IP}"
+                )
+
     def tcp_message(self, flow: TCPFlow) -> None:
         stats = self._flows.get(flow.id)
         if stats is None:
@@ -103,13 +112,13 @@ class NX502Monitor:
 
         msg: TCPMessage = flow.messages[-1]
         size = len(msg.content)
-        now = time.time()
-
-        if stats.last_msg_ts is not None:
-            stats.intervals_ms.append((now - stats.last_msg_ts) * 1000.0)
-        stats.last_msg_ts = now
 
         if msg.from_client:
+            now = time.time()
+            if stats.last_rx_ts is not None:
+                stats.rx_intervals_ms.append((now - stats.last_rx_ts) * 1000.0)
+            stats.last_rx_ts = now
+
             stats.rx_packets += 1
             stats.rx_bytes   += size
             self._consume_inbound(stats, msg.content)
@@ -126,8 +135,8 @@ class NX502Monitor:
         total_packets  = stats.rx_packets + stats.tx_packets
         total_bytes    = stats.rx_bytes   + stats.tx_bytes
         avg_interval   = (
-            sum(stats.intervals_ms) / len(stats.intervals_ms)
-            if stats.intervals_ms else 0.0
+            sum(stats.rx_intervals_ms) / len(stats.rx_intervals_ms)
+            if stats.rx_intervals_ms else 0.0
         )
 
         _log(
@@ -140,10 +149,11 @@ class NX502Monitor:
             f"[{_ts()}] 📊 [STATS] "
             f"RX pkts={stats.rx_packets} ({stats.rx_bytes} B) | "
             f"TX pkts={stats.tx_packets} ({stats.tx_bytes} B) | "
-            f"avg interval={avg_interval:.2f} ms "
+            f"avg RX interval={avg_interval:.2f} ms "
             f"(expected {EXPECTED_INTERVAL_MS:.0f} ms) | "
             f"JSON ok={stats.json_ok} err={stats.json_errors} "
-            f"schema={stats.schema_errors} range={stats.range_errors}"
+            f"schema={stats.schema_errors} range={stats.range_errors} "
+            f"oversize={stats.oversize_drops}"
         )
 
         if stats.rx_buffer:
@@ -154,8 +164,9 @@ class NX502Monitor:
             )
 
     def tcp_error(self, flow: TCPFlow) -> None:
-        err = flow.error.msg if flow.error else "unknown"
-        _log(f"[{_ts()}] ❌ [ERROR] TCP: {err}")
+        err_obj = getattr(flow, "error", None)
+        err_msg = getattr(err_obj, "msg", None) or repr(err_obj) or "unknown"
+        _log(f"[{_ts()}] ❌ [ERROR] TCP: {err_msg}")
 
     # ---------------------------------------------------------------- payload
     def _consume_inbound(self, stats: FlowStats, data: bytes) -> None:
@@ -163,7 +174,17 @@ class NX502Monitor:
         while True:
             nl = stats.rx_buffer.find(b"\n")
             if nl < 0:
+                if len(stats.rx_buffer) > MAX_LINE_BYTES:
+                    stats.oversize_drops += 1
+                    preview = bytes(stats.rx_buffer[:64]).decode("utf-8", "replace")
+                    _log(
+                        f"[{_ts()}] ⚠️  [WARN] dropping oversize frame "
+                        f"({len(stats.rx_buffer)} B > {MAX_LINE_BYTES} B, "
+                        f"no newline): {preview!r}"
+                    )
+                    stats.rx_buffer.clear()
                 break
+
             line = bytes(stats.rx_buffer[:nl]).strip()
             del stats.rx_buffer[: nl + 1]
             if line:
@@ -219,17 +240,11 @@ class NX502Monitor:
                 continue
             if v < lo:
                 stats.range_errors += 1
-                _log(
-                    f"[{_ts()}] ⚠️  [WARN] {field}={v} "
-                    f"out of range (min {lo})"
-                )
+                _log(f"[{_ts()}] ⚠️  [WARN] {field}={v} out of range (min {lo})")
                 ok = False
             elif v > hi:
                 stats.range_errors += 1
-                _log(
-                    f"[{_ts()}] ⚠️  [WARN] {field}={v} "
-                    f"out of range (max {hi})"
-                )
+                _log(f"[{_ts()}] ⚠️  [WARN] {field}={v} out of range (max {hi})")
                 ok = False
 
         if ok:
@@ -239,8 +254,11 @@ class NX502Monitor:
 def load(loader) -> None:
     _log(f"[{_ts()}] 🚀 [BOOT] NX502 mitmproxy monitor loaded")
     _log(
-        f"[{_ts()}] ℹ️  [INFO] required={list(REQUIRED_FIELDS)} "
-        f"ranges={RANGES} expected_interval={EXPECTED_INTERVAL_MS:.0f}ms"
+        f"[{_ts()}] ℹ️  [INFO] listen={DISPLAY_LISTEN} "
+        f"required={list(REQUIRED_FIELDS)} ranges={RANGES} "
+        f"expected_interval={EXPECTED_INTERVAL_MS:.0f}ms "
+        f"max_line={MAX_LINE_BYTES} B "
+        f"expected_guest_ip={EXPECTED_GUEST_IP or '(any)'}"
     )
 
 

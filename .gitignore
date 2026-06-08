@@ -1,0 +1,16 @@
+# local env (may contain LAN topology)
+.env
+
+# python addon caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# captured logs (volume mount artifacts)
+logs/
+*.log
+
+# editor / OS noise
+.vscode/
+.idea/
+.DS_Store
