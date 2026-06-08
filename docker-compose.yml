@@ -1,31 +1,57 @@
-version: "3.8"
-
 services:
+  # ------------------------------------------------------------------
+  # TCP sink — upstream target for mitmproxy's reverse:tcp mode.
+  # mitmproxy needs a working upstream socket for tcp_message hooks
+  # to fire; this socat process simply discards anything it receives.
+  # ------------------------------------------------------------------
+  sink:
+    image: alpine/socat:latest
+    container_name: nx502-mitmproxy-sink
+    restart: unless-stopped
+    command: -u TCP-LISTEN:65000,fork,reuseaddr,bind=0.0.0.0 /dev/null
+    networks:
+      nx502-net:
+        ipv4_address: 172.28.0.11
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+  # ------------------------------------------------------------------
+  # mitmproxy — listens on TCP/9999, mirrors traffic through `sink`,
+  # and runs the NX502 monitor addon which logs everything to stdout.
+  # ------------------------------------------------------------------
   mitmproxy:
     image: mitmproxy/mitmproxy:11.0
     container_name: nx502-mitmproxy
     restart: unless-stopped
+    depends_on:
+      - sink
     ports:
       - "${MITM_LISTEN_HOST:-0.0.0.0}:${MITM_LISTEN_PORT:-9999}:9999"
     volumes:
       - ./addon:/app:ro
-      - ./logs:/var/log/mitmproxy
     environment:
-      - TZ=${TZ:-Asia/Tokyo}
-      - HOST_IP=${HOST_IP:-192.168.250.100}
-      - GUEST_IP=${GUEST_IP:-192.168.250.101}
-      - PYTHONUNBUFFERED=1
+      TZ: ${TZ:-Asia/Tokyo}
+      PYTHONUNBUFFERED: "1"
+      HOST_IP: ${HOST_IP:-192.168.250.100}
+      GUEST_IP: ${GUEST_IP:-192.168.250.101}
+      DISPLAY_LISTEN: "${MITM_LISTEN_HOST:-0.0.0.0}:${MITM_LISTEN_PORT:-9999}"
+      EXPECTED_GUEST_IP: ${GUEST_IP:-192.168.250.101}
+      MAX_LINE_BYTES: ${MAX_LINE_BYTES:-1048576}
+      EXPECTED_INTERVAL_MS: ${EXPECTED_INTERVAL_MS:-50}
     command: >
       mitmdump
+      --mode reverse:tcp://sink:65000@9999
       --listen-host 0.0.0.0
-      --listen-port 9999
       -s /app/mitmproxy_addon.py
       --flow-detail 3
-      --no-server
+      --set console_eventlog_verbosity=info
     stdin_open: true
     tty: true
     logging:
-      driver: "json-file"
+      driver: json-file
       options:
         max-size: "50m"
         max-file: "5"
@@ -35,6 +61,7 @@ services:
 
 networks:
   nx502-net:
+    name: nx502-net
     driver: bridge
     ipam:
       config:
